@@ -1,19 +1,19 @@
-""" Time Series Modeling module """
+""" Time Series Modelling module """
 
 import os
-from pathlib import Path
-from datetime import datetime
 import pickle
 import logging
-
 import numpy as np
 import pandas as pd
-from fbprophet import Prophet
+from fbprophet import Prophet  # TODO: Add to requirements.txt
+from datetime import datetime
+
+# import country_converter # TODO: Add to requirements.txt
 from sklearn.model_selection import ParameterGrid
+import boto3  # TODO: add to requirements.txt
+from botocore.exceptions import ClientError
+from pathlib import Path
 
-from utils import set_logger
-
-set_logger()
 logger = logging.getLogger("corona")
 
 DEFAULT_PROPHET_PARAMS_GRID = {
@@ -21,11 +21,51 @@ DEFAULT_PROPHET_PARAMS_GRID = {
     "seasonality_prior_scale": [1, 3, 10, 30],
     "changepoint_range": [0.8, 0.9],
     "changepoint_prior_scale": [0.01, 0.03, 0.1, 0.3, 1, 3],
-    "n_changepoints": [10, 30],
-    "seasonality_mode": ["additive", "multiplicative"],
+    "n_changepoints": [5, 10, 30, 50],
+    "seasonality_mode": ["additive"],
 }
 
-class TSProphet(object):
+black_friday = pd.DataFrame(
+    {
+        "holiday": "black_friday",
+        "ds": pd.to_datetime(["2018-11-23", "2019-11-29", "2020-11-11"]),
+        #'lower_window': -6,
+        #'upper_window': 6,
+    }
+)
+
+
+class _suppress_stdout_stderr(object):
+    """
+	A context manager for doing a "deep suppression" of stdout and stderr in
+	Python, i.e. will suppress all print, even if the print originates in a
+	compiled C/Fortran sub-function.
+	   This will not suppress raised exceptions, since exceptions are printed
+	to stderr just before a script exits, and after the context manager has
+	exited (at least, I think that is why it lets exceptions through).
+	"""
+
+    def __init__(self):
+        # Open a pair of null files
+        self.null_fds = [os.open(os.devnull, os.O_RDWR) for x in range(2)]
+        # Save the actual stdout (1) and stderr (2) file descriptors.
+        self.save_fds = [os.dup(1), os.dup(2)]
+
+    def __enter__(self):
+        # Assign the null pointers to stdout and stderr.
+        os.dup2(self.null_fds[0], 1)
+        os.dup2(self.null_fds[1], 2)
+
+    def __exit__(self, *_):
+        # Re-assign the real stdout/stderr back to (1) and (2)
+        os.dup2(self.save_fds[0], 1)
+        os.dup2(self.save_fds[1], 2)
+        # Close the null files
+        for fd in self.null_fds + self.save_fds:
+            os.close(fd)
+
+
+class TimeSeries(object):
 
     """
 	This class generates time series forecasts using Facebook Prophet model for different set of options.
@@ -34,15 +74,18 @@ class TSProphet(object):
 
 	Parameters
 	----------
-	input_series: time series input data
-	input_freq: frequency of the time series
-	validation_split_date: date for splitting training and validation
-	train_until_date: end date of training period
-	horizon_date: last date
+	input_series: pd.Series
+	input_freq: str
+	validation_split_date: str 
+	train_until_date: str
+	horizon_date: str
 	pretrained_model: str
 	optimized_params: dict
 	prophet_params_grid: dict
+	add_country_holidays: bool
+	add_black_friday: bool
 	add_montly_seasonality: bool
+	country_name: str
 	transform: str
 	save: bool
 	file_name: str
@@ -65,12 +108,17 @@ class TSProphet(object):
         horizon_date: str = None,
         optimized_params: dict = None,
         prophet_params_grid: dict = None,
+        add_country_holidays: bool = False,  # TODO
+        add_black_friday: bool = False,
         add_montly_seasonality: bool = False,
+        country_name: str = None,  # TODO
         transform: str = None,  # Allow logaritmic and Boxcox transformations
         save: bool = False,
         use_pretrained_model: bool = None,
         local_path: str = None,
-        model_name: str = None
+        model_name: str = None,
+        s3_load: bool = False,
+        s3_save: bool = False,
     ):
         assert isinstance(
             input_series.index, pd.DatetimeIndex
@@ -82,7 +130,6 @@ class TSProphet(object):
 
         self.input_freq = input_freq
 
-        # TODO: set default date for validation
         if validation_split_date is not None:
             self.validation_split_date = pd.Timestamp(validation_split_date)
 
@@ -91,17 +138,15 @@ class TSProphet(object):
         else:
             self.prophet_params_grid = DEFAULT_PROPHET_PARAMS_GRID
 
-        # TODO: set default horizon
         if horizon_date is not None:
             self.horizon_date = pd.Timestamp(horizon_date)
 
-        # TODO: set default (last date of series)
         if train_until_date is not None:
             self.train_until_date = pd.Timestamp(train_until_date)
 
         # TODO: review logic for using pre-trained model, tuning+training, training
         if use_pretrained_model is True:
-            self.ts_model = self._load_model(local_path, model_name)
+            self.ts_model = self._load_model(local_path, model_name, s3_load=s3_load)
         else:
             if optimized_params is None:
                 optimized_params = self._tune_parameters()
@@ -110,9 +155,9 @@ class TSProphet(object):
             if save is True:
                 self._save_model(local_path, model_name, s3_save=s3_save)
 
-    def _load_model(self, local_path, model_name):
+    def _load_model(self, local_path, model_name, s3_load):
         """
-		Load pre-trained model. The model is loaded from a local location.
+		Load pre-trained model. The model can be load either from a local location or from the S3 bucket.
 
 		Parameters
 		----------
@@ -120,14 +165,39 @@ class TSProphet(object):
 			Path to pre-trained model.
 		model_name: str
 			Name of the pickle file.
+		s3_load: bool
+			Whether or not you want to load the model from the S3 bucket
 		"""
-        try:
+        if s3_load:
+            try:
+                client = boto3.client("s3")
+
+                response = client.get_object(
+                    Bucket="ngap--marketplace-analytics--prod--eu-west-1",
+                    Key="qa/analytics/prophet-models/{name}".format(name=model_name),
+                )
+
+                serialized_object = response["Body"].read()
+
+                return pickle.loads(serialized_object)
+                logger.info("{} Prophet model loaded from S3 bucket".format(model_name))
+
+            except ClientError as error:
+                response = error.response.get("Error", dict()).get("Code", "")
+                if response == "ExpiredToken":
+                    logger.error(
+                        "AWS Token has expired: run gimme-aws-creds to get the credentials"
+                    )
+                else:
+                    logger.error("Unexpected AWS error: %s" % error)
+                raise error
+        else:
             file = Path(local_path, model_name)
             if file.exists():
                 with open(file, "rb") as f:
                     return pickle.load(f)
-        except OSError:
-            logger.error("Can't find model in local directory")
+
+        raise OSError("Can't find model in local directory nor in AWS")
 
     def _eval_model(self, model):
         """
